@@ -1,0 +1,218 @@
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+    env_file:
+      - ./backend/.env
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_DB=${DB_NAME}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app-network
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app-network
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    restart: unless-stopped
+    # Délai pour laisser Zookeeper bien démarrer
+    command: sh -c 'sleep 10 && /etc/confluent/docker/run'
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "29092"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app-network
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
+  backend:
+    build: ./backend
+    image: monprojet-backend
+    restart: unless-stopped
+    command: gunicorn pollution_prediction.wsgi:application --bind 0.0.0.0:8000
+    volumes:
+      - ./backend/:/app/
+      - static_volume:/app/staticfiles
+      - media_volume:/app/media
+      - model_volume:/app/models
+    env_file:
+      - ./backend/.env
+    depends_on:
+      db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      - DEBUG=${DEBUG}
+      - SECRET_KEY=${SECRET_KEY}
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_HOST=db
+      - DB_PORT=5432
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - RESEND_API_KEY=${RESEND_API_KEY}
+      - DEFAULT_FROM_EMAIL=${DEFAULT_FROM_EMAIL}
+      - DATABASE=postgres
+    networks:
+      - app-network
+
+  producer:
+    build: ./backend
+    image: monprojet-producer
+    restart: unless-stopped
+    command: python manage.py run_kafka_producer
+    volumes:
+      - ./backend/:/app/
+    env_file:
+      - ./backend/.env
+    depends_on:
+      db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY}
+      - OPENAQ_API_KEY=${OPENAQ_API_KEY}
+      - DB_HOST=db
+      - DATABASE=postgres
+    networks:
+      - app-network
+
+  processor:
+    build: ./backend
+    image: monprojet-processor
+    restart: unless-stopped
+    command: python manage.py run_kafka_processor
+    volumes:
+      - ./backend/:/app/
+    env_file:
+      - ./backend/.env
+    depends_on:
+      db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - DB_HOST=db
+      - DATABASE=postgres
+    networks:
+      - app-network
+
+  consumer:
+    build: ./backend
+    image: monprojet-consumer
+    restart: unless-stopped
+    command: python manage.py run_kafka_consumer
+    volumes:
+      - ./backend/:/app/
+      - model_volume:/app/models
+    env_file:
+      - ./backend/.env
+    depends_on:
+      db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - DB_HOST=db
+      - DATABASE=postgres
+    networks:
+      - app-network
+
+  frontend-build-local:
+    image: node:18-alpine
+    working_dir: /app
+    command: sh -c "npm ci && npm run build"
+    volumes:
+      - ./frontend:/app
+      - ./frontend/dist:/app/dist
+    networks:
+      - app-network
+
+  nginx:
+    image: nginx:1.25
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./backend/nginx/nginx.conf:/etc/nginx/conf.d/default.conf
+      - static_volume:/home/app/staticfiles
+      - media_volume:/home/app/media
+      - ./frontend/dist:/usr/share/nginx/html:ro
+    depends_on:
+      - frontend-build-local
+      - backend
+    networks:
+      - app-network
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: pgadmin
+    restart: always
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    depends_on:
+      - db
+    networks:
+      - app-network
+
+volumes:
+  postgres_data:
+  static_volume:
+  media_volume:
+  model_volume:
+  pgadmin_data:
+  kafka_data:
+  zookeeper_data:
+
+networks:
+  app-network:
+    driver: bridge 
